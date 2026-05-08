@@ -167,6 +167,40 @@ python plot_aggregate_controller_comparison.py galileo_topfull 0 ./admission-res
 
 The plot will be available in a file named `galileo_topfull.png` in `admission/plots/figures/`. Change the respective argument in the above command to save in a different file.
 
+### Jaeger Trace Latency Sweeps
+
+To collect sampled end-to-end and per-service latencies from Jaeger while varying replicas and workload, run the trace experiment helper from the Kubernetes control node:
+
+```bash
+python3 jaeger-collector/trace_experiment.py \
+  --app hotelreservation \
+  --gateway-url http://10.10.1.1:32000 \
+  --workload fixed_200 \
+  --workload fixed_500 \
+  --replica-set frontend=1,search=1,reservation=1 \
+  --replica-set frontend=2,search=2,reservation=2 \
+  --duration 300 \
+  --warmup 30 \
+  --out-dir trace-results/reservation
+```
+
+For Social Network:
+
+```bash
+python3 jaeger-collector/trace_experiment.py \
+  --app socialmedia \
+  --gateway-url http://10.10.1.1:32000 \
+  --workload fixed_200 \
+  --workload fixed_500 \
+  --replica-set nginx-thrift=1,compose-post-service=1,home-timeline-service=1 \
+  --replica-set nginx-thrift=2,compose-post-service=2,home-timeline-service=2 \
+  --duration 300 \
+  --warmup 30 \
+  --out-dir trace-results/social
+```
+
+Each scenario directory contains `jaeger-latency-summary.json` and `jaeger-latency-summary.csv`. The CSV includes one end-to-end row per request type and one service-latency row per service in that request path. Workloads can be fixed rates such as `fixed_500`, or paths to RPS trace files. The helper uses Locust (`client/locust_reservation.py` and `client/locust_social.py`) and does not use `wrk2`.
+
 
 ## General Usage
 

@@ -5,6 +5,7 @@ import time
 import pickle
 import requests
 import datetime
+import statistics
 from google.protobuf.timestamp_pb2 import Timestamp
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -44,7 +45,7 @@ def grpc_query_service(stub):
 #   }
 # }
 def construct_trace(trace, trace_id):
-    trace_dict = {"trace_id": trace_id, "spans": {}}
+    trace_dict = {"trace_id": trace_id, "spans": {}, "operations": {}}
 
     # NOTE: Currently not subtracting latencies
     # # Sort trace by durations
@@ -76,7 +77,48 @@ def construct_trace(trace, trace_id):
                 trace_dict["spans"][service], span_details[2]
             )
 
+        operation = span_details[4]
+        if service not in trace_dict["operations"]:
+            trace_dict["operations"][service] = set()
+        trace_dict["operations"][service].add(operation)
+
     return trace_dict
+
+
+def _duration_to_us(duration):
+    return (duration.seconds * 1000000) + (duration.nanos / 1000)
+
+
+def _percentile(values, percentile):
+    if len(values) == 0:
+        return 0
+    sorted_values = sorted(values)
+    rank = (len(sorted_values) - 1) * percentile / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = rank - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
+def summarize_latencies(latencies):
+    if len(latencies) == 0:
+        return {
+            "count": 0,
+            "mean_ms": 0,
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "p99_ms": 0,
+            "max_ms": 0,
+        }
+
+    return {
+        "count": len(latencies),
+        "mean_ms": statistics.mean(latencies),
+        "p50_ms": _percentile(latencies, 50),
+        "p95_ms": _percentile(latencies, 95),
+        "p99_ms": _percentile(latencies, 99),
+        "max_ms": max(latencies),
+    }
 
 
 # Query traces of a service
@@ -169,7 +211,7 @@ def grpc_query_traces(
                             else:
                                 svc_count[svc] += 1
                         all_traces.append(trace_dict)
-                        curr_trace_id = None
+                        curr_trace_id = span.trace_id.hex()
                         trace = []
 
                 # Add details of the span
@@ -178,8 +220,8 @@ def grpc_query_traces(
                 if len(span.references) > 0:
                     parent_span_id = span.references[0].span_id.hex()
                 service = span.process.service_name
-                duration = span.duration.nanos / 1000
-                trace.append([span_id, service, duration, parent_span_id])
+                duration = _duration_to_us(span.duration)
+                trace.append([span_id, service, duration, parent_span_id, span.operation_name])
 
         if curr_trace_id != None:
             trace_dict = construct_trace(trace, curr_trace_id)
@@ -288,6 +330,68 @@ def get_latencies_by_type(period, jaeger_ip, frontend_service, request_types):
                 break
 
     return type_latencies
+
+
+def get_trace_latency_summary(period, jaeger_ip, frontend_service, request_types):
+    channel = create_grpc_channel(jaeger_ip)
+    stub = create_grpc_stub(channel)
+
+    exp_start_time = datetime.datetime.now()
+    traces = grpc_query_traces(
+        stub, exp_start_time=exp_start_time, service_name=frontend_service, period=period
+    )
+
+    by_type = {}
+    for request_type in request_types:
+        by_type[request_type["name"]] = {
+            "e2e_ms": [],
+            "service_ms": {service: [] for service in request_type["execution_path"]},
+        }
+
+    unmatched = 0
+    matching_order = sorted(
+        request_types, key=lambda request_type: len(request_type["execution_path"]), reverse=True
+    )
+
+    for trace in traces:
+        matched = False
+        for request_type in matching_order:
+            execution_path = request_type["execution_path"]
+            if not all(service in trace["spans"] for service in execution_path):
+                continue
+
+            request_summary = by_type[request_type["name"]]
+            if frontend_service in trace["spans"]:
+                request_summary["e2e_ms"].append(trace["spans"][frontend_service] / 1000)
+            else:
+                request_summary["e2e_ms"].append(max(trace["spans"].values()) / 1000)
+
+            for service in execution_path:
+                request_summary["service_ms"][service].append(trace["spans"][service] / 1000)
+
+            matched = True
+            break
+
+        if not matched:
+            unmatched += 1
+
+    summary = {
+        "period_seconds": period,
+        "frontend_service": frontend_service,
+        "num_traces": len(traces),
+        "num_unmatched_traces": unmatched,
+        "request_types": {},
+    }
+    for request_type, request_summary in by_type.items():
+        summary["request_types"][request_type] = {
+            "e2e": summarize_latencies(request_summary["e2e_ms"]),
+            "services": {
+                service: summarize_latencies(latencies)
+                for service, latencies in request_summary["service_ms"].items()
+            },
+        }
+
+    return summary
 
 
 if __name__ == "__main__":
